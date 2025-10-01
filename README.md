@@ -35,9 +35,6 @@ substation_SME_assistant/
 ├── vectordb/ # Auto-created: FAISS DBs
 └── file_temp/ # Auto-created: temp uploads
 
-yaml
-Copy code
-
 ---
 
 ## ⚙️ Installation
@@ -46,24 +43,19 @@ Copy code
    ```bash
    git clone https://github.com/your-username/substation_SME_assistant.git
    cd substation_SME_assistant
-Create virtual environment:
+   
+## Create virtual environment:
 
-bash
-Copy code
 python -m venv venv
 venv\Scripts\activate   # On Windows
 source venv/bin/activate  # On Linux/Mac
-Install dependencies:
 
-bash
-Copy code
+Install dependencies:
 pip install -r requirements.txt
+
 Add .env with your Gemini API key:
 
-ini
-Copy code
 GEMINI_API_KEY=your_google_api_key_here
+
 ▶️ Run the App
-bash
-Copy code
 streamlit run main.py
