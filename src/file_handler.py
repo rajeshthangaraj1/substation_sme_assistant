@@ -6,16 +6,16 @@ import hashlib
 import pandas as pd
 import fitz  # PyMuPDF for PDF rendering
 import google.generativeai as genai
+import numpy as np
+import faiss
+import mimetypes
 from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings.base import Embeddings
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from docx import Document  # for extracting DOCX images
 
 from config.constants import (
     VECTOR_DB_PATH,
-    EMBEDDING_CHUNK_SIZE,
-    EMBEDDING_CHUNK_OVERLAP,
     GEMINI_API_KEY,
     GEMINI_EMBED_MODEL,
 )
@@ -52,11 +52,21 @@ class GeminiEmbeddings(Embeddings):
             logger.error(f"Embedding query error: {e}")
             return [0.0] * 768
 
-    def embed_image_bytes(self, img_bytes):
+    def embed_image_bytes(self, img_bytes, mime_type="image/png"):
+        """Embed raw image bytes with MIME type detection"""
         try:
             resp = genai.embed_content(
                 model=self.model,
-                content={"image": {"bytes": img_bytes}},
+                content={
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": img_bytes,
+                            }
+                        }
+                    ]
+                },
             )
             return resp["embedding"]
         except Exception as e:
@@ -64,10 +74,14 @@ class GeminiEmbeddings(Embeddings):
             return [0.0] * 768
 
     def embed_image(self, image_path):
+        """Embed image from file path with auto-detected MIME type"""
         try:
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if mime_type is None:
+                mime_type = "image/png"  # fallback
             with open(image_path, "rb") as img_file:
                 img_bytes = img_file.read()
-            return self.embed_image_bytes(img_bytes)
+            return self.embed_image_bytes(img_bytes, mime_type=mime_type)
         except Exception as e:
             logger.error(f"Image embedding error: {e}")
             return [0.0] * 768
@@ -81,7 +95,6 @@ class FileHandler:
 
     def handle_file_upload(self, file_path, original_filename):
         """Process uploaded file → extract text/images → embed → save FAISS"""
-
         try:
             with open(file_path, "rb") as f:
                 content = f.read()
@@ -99,39 +112,45 @@ class FileHandler:
 
             # Extract multimodal docs (text + images)
             docs = self.load_document(file_path, original_filename)
-
             if not docs:
                 return {"message": "No content extracted", "collection": file_key}
 
-            texts = []
-            metadatas = []
-            vectors = []
-
+            texts, vectors, metadatas = [], [], []
             for d in docs:
                 if d["type"] == "text":
                     texts.append(d["content"])
+                    vectors.append(self.embeddings.embed_query(d["content"]))
                     metadatas.append(d["metadata"])
                 elif d["type"] == "image":
-                    # placeholder text for FAISS docstore
                     texts.append("[Image]")
-                    metadatas.append(d["metadata"])
                     vectors.append(d["vector"])
+                    metadatas.append(d["metadata"])
 
-            # Build FAISS with text entries
-            vector_store = FAISS.from_texts(
-                texts,
-                embedding=self.embeddings,
-                metadatas=metadatas,
+            if not vectors:
+                return {"message": "No embeddings generated", "collection": file_key}
+
+            # ---- Build FAISS index manually ----
+            dim = len(vectors[0])
+            index = faiss.IndexFlatL2(dim)
+            index.add(np.array(vectors).astype("float32"))
+
+            # ---- Build docstore & mapping ----
+            docstore = {}
+            index_to_docstore_id = {}
+            for i, (txt, meta) in enumerate(zip(texts, metadatas)):
+                docstore[str(i)] = {"page_content": txt, "metadata": meta}
+                index_to_docstore_id[i] = str(i)
+
+            # ---- Wrap with LangChain FAISS ----
+            vector_store = FAISS(
+                embedding_function=self.embeddings,  # ✅ FIXED
+                index=index,
+                docstore=docstore,
+                index_to_docstore_id=index_to_docstore_id,
             )
-
-            # Replace FAISS vectors for image entries with real image embeddings
-            for i, d in enumerate(docs):
-                if d["type"] == "image":
-                    vector_store.index.replace(i, d["vector"])
 
             # Save FAISS + metadata
             vector_store.save_local(vector_store_dir)
-
             with open(os.path.join(vector_store_dir, "metadata.json"), "w") as md:
                 json.dump({"filename": original_filename}, md)
 
@@ -154,7 +173,6 @@ class FileHandler:
                 all_docs = loader.load()
 
                 pdf_doc = fitz.open(file_path)
-
                 for page_num, page in enumerate(pdf_doc, start=1):
                     # Extract text for this page
                     page_text = " ".join(
@@ -170,7 +188,7 @@ class FileHandler:
                     # Render page image → embedding
                     pix = page.get_pixmap(dpi=144)
                     img_bytes = pix.tobytes("png")
-                    img_vector = self.embeddings.embed_image_bytes(img_bytes)
+                    img_vector = self.embeddings.embed_image_bytes(img_bytes, mime_type="image/png")
                     docs.append({
                         "type": "image",
                         "vector": img_vector,
@@ -195,7 +213,7 @@ class FileHandler:
                     for rel in doc.part.rels.values():
                         if "image" in rel.target_ref:
                             img_bytes = rel.target_part.blob
-                            img_vector = self.embeddings.embed_image_bytes(img_bytes)
+                            img_vector = self.embeddings.embed_image_bytes(img_bytes, mime_type="image/png")
                             docs.append({
                                 "type": "image",
                                 "vector": img_vector,
